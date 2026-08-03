@@ -11,6 +11,7 @@
 #include "devices/kbd.h"
 #include "devices/input.h"
 #include "devices/serial.h"
+
 #include "devices/shutdown.h"
 #include "devices/timer.h"
 #include "devices/vga.h"
@@ -133,7 +134,34 @@ pintos_init (void)
     /* Run actions specified on kernel command line. */
     run_actions (argv);
   } else {
-    // TODO: no command line passed to kernel. Run interactively 
+    // TODO: no command line passed to kernel. Run interactively
+    uint8_t c;
+    char line[64];
+    size_t pos;
+    while (true) {
+      pos = 0;
+      printf ("IMPERIAL>");
+      while (true) {
+        c = input_getc();
+        if (c == '\r') {
+          printf("\n");
+          break;
+        }
+        printf("%c", c);
+        if (pos < 63) {
+          line[pos] = c;
+          pos += 1;
+        }
+      }
+      line[pos] = '\0';
+      if (!strcmp (line, "whoami"))
+        printf ("Jeremy Tan, 02372939\n");
+      else if (!strcmp (line, "exit"))
+        break;
+      else
+        printf ("invalid command\n");
+    }
+
   }
 
   /* Finish up. */

@@ -5,7 +5,7 @@
 #### The loader (in loader.S) loads the kernel at physical address
 #### 0x20000 (128 kB) and jumps to "start", defined here.  This code
 #### switches from real mode to 32-bit protected mode and calls
-#### pintos_init().
+#### pintos_init().∏
 
 /* Flags in control register 0. */
 #define CR0_PE 0x00000001      /* Protection Enable. */
