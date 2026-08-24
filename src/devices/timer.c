@@ -190,7 +190,7 @@ timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
-
+  struct thread *curr = thread_current();
   while (!list_empty (&sleep_list))
     {
       struct thread *t = list_entry (list_front (&sleep_list), struct thread,
@@ -199,6 +199,8 @@ timer_interrupt (struct intr_frame *args UNUSED)
         break;
       list_pop_front (&sleep_list);
       sema_up (&t->sleep_sema);
+      if (t->priority > curr->priority)
+        intr_yield_on_return();
     }
 }
 

@@ -4,6 +4,8 @@
 #include <random.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "../lib/kernel/list.h"
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
@@ -200,6 +202,9 @@ thread_create (const char *name, int priority,
 
   /* Add to run queue. */
   thread_unblock (t);
+  struct thread *curr = thread_current();
+  if (t->priority > curr->priority)
+    thread_yield();
 
   return tid;
 }
@@ -237,7 +242,7 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  list_insert_ordered(&ready_list, &t->elem, &thread_priority_greater, NULL);
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -296,6 +301,13 @@ thread_exit (void)
   NOT_REACHED ();
 }
 
+bool
+thread_priority_greater (const struct list_elem *a, const struct list_elem *b, void *aux)
+{
+  return list_entry(a, struct thread, elem)->priority
+          > list_entry(b, struct thread, elem)->priority;
+}
+
 /** Yields the CPU.  The current thread is not put to sleep and
    may be scheduled again immediately at the scheduler's whim. */
 void
@@ -307,8 +319,9 @@ thread_yield (void)
   ASSERT (!intr_context ());
 
   old_level = intr_disable ();
-  if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+  if (cur != idle_thread) {
+    list_insert_ordered(&ready_list, &cur->elem, &thread_priority_greater, NULL);
+  }
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -336,6 +349,12 @@ void
 thread_set_priority (int new_priority) 
 {
   thread_current ()->priority = new_priority;
+  if (!list_empty(&ready_list)) {
+    struct thread *t = list_entry(list_begin(&ready_list), struct thread, elem);
+    if (t->priority > new_priority)
+      thread_yield();
+  }
+
 }
 
 /** Returns the current thread's priority. */
