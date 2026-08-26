@@ -94,6 +94,10 @@ struct thread
     struct semaphore sleep_sema;  /* Blocks/unblocks this thread while sleeping */
     struct list_elem sleepelem;   /* Hooks this thread into the sleep_list */
 
+   int base_priority; /*Original priority before donation*/
+   struct list locks_held; /* Locks currently held by this thread. */
+   struct lock *waiting_on_lock; /* Lock this thread is blocked on, or NULL. */
+
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /**< List element. */
 
@@ -137,6 +141,7 @@ void thread_foreach (thread_action_func *, void *);
 
 int thread_get_priority (void);
 void thread_set_priority (int);
+void thread_yield_to_higher_priority (void) ;
 
 int thread_get_nice (void);
 void thread_set_nice (int);
