@@ -13,6 +13,8 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "threads/fixed-point.h"
+#include "devices/timer.h"          /* TIMER_FREQ, timer_ticks() */
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -61,6 +63,9 @@ static unsigned thread_ticks;   /**< # of timer ticks since last yield. */
    Controlled by kernel command-line option "-o mlfqs". */
 bool thread_mlfqs;
 
+/** System-wide load average (fixed-point), for the MLFQS scheduler. */
+static fixed_point_t load_avg;
+
 static void kernel_thread (thread_func *, void *aux);
 
 static void idle (void *aux UNUSED);
@@ -72,6 +77,10 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
+static int mlfqs_priority (const struct thread *);
+static fixed_point_t mlfqs_recent_cpu (const struct thread *);
+static void mlfqs_update_load_avg (void);
+static void mlfqs_refresh_thread (struct thread *t, void *aux);
 
 /** Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
@@ -100,6 +109,7 @@ thread_init (void)
   init_thread (initial_thread, "main", PRI_DEFAULT);
   initial_thread->status = THREAD_RUNNING;
   initial_thread->tid = allocate_tid ();
+  load_avg = 0;
 }
 
 /** Starts preemptive thread scheduling by enabling interrupts.
@@ -135,6 +145,33 @@ thread_tick (void)
 #endif
   else
     kernel_ticks++;
+
+  /* ---- MLFQS: advanced scheduler bookkeeping ---- */
+  if (thread_mlfqs) {
+    int64_t ticks = timer_ticks ();
+
+    /* (a) Every tick: t->recent_cpu += 1 */
+    if (t != idle_thread)
+      t->recent_cpu = fixed_add_int (t->recent_cpu, 1);
+
+    /* (b) Once per second: update load_avg, then recent_cpu + priority for ALL. */
+    if (ticks % TIMER_FREQ == 0) {
+      mlfqs_update_load_avg ();
+      thread_foreach (mlfqs_refresh_thread, NULL);   /* recent_cpu then priority */
+      list_sort (&ready_list, thread_priority_greater, NULL);
+    }
+    /* (c) Otherwise, every 4th tick recompute the current thread's priority. */
+    else if (ticks % 4 == 0 && t != idle_thread)
+      t->priority = mlfqs_priority (t);
+
+    /* Preempt on return if a ready thread now outranks the running one.
+       We are in interrupt context, so schedule the yield rather than
+       calling thread_yield() directly. */
+    if (!list_empty (&ready_list)
+        && list_entry (list_front (&ready_list), struct thread, elem)->priority
+           > t->priority)
+      intr_yield_on_return ();
+  }
 
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
@@ -184,6 +221,15 @@ thread_create (const char *name, int priority,
   /* Initialize thread. */
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
+  t->nice = thread_current ()->nice;
+  t->recent_cpu = thread_current ()->recent_cpu;
+  if (thread_mlfqs)
+  {
+    /* Priority is derived from the formula, not the passed-in arg. */
+    enum intr_level old = intr_disable ();
+    t->priority = mlfqs_priority (t);   /* PRI_MAX - recent_cpu/4 - nice*2, clamped */
+    intr_set_level (old);
+  }
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
@@ -348,6 +394,9 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority)
 {
+  //Do nothing if thread_mlfqs
+  if (thread_mlfqs) return;
+
   struct thread *curr = thread_current ();
   curr->base_priority = new_priority;
 
@@ -400,31 +449,33 @@ thread_yield_to_higher_priority (void)
 void
 thread_set_nice (int nice UNUSED)
 {
-  /* Not yet implemented. */
+  struct thread *curr = thread_current ();
+  curr->nice = nice;
+  if (thread_mlfqs) {
+    mlfqs_priority(curr);
+    thread_yield_to_higher_priority();
+  }
 }
 
 /** Returns the current thread's nice value. */
 int
 thread_get_nice (void)
 {
-  /* Not yet implemented. */
-  return 0;
+  return thread_current()->nice;
 }
 
 /** Returns 100 times the system load average. */
 int
 thread_get_load_avg (void)
 {
-  /* Not yet implemented. */
-  return 0;
+  return fixed_to_int_round (fixed_mul_int (load_avg, 100));
 }
 
 /** Returns 100 times the current thread's recent_cpu value. */
 int
 thread_get_recent_cpu (void)
 {
-  /* Not yet implemented. */
-  return 0;
+  return fixed_to_int_round (fixed_mul_int (thread_current ()->recent_cpu, 100));
 }
 
 /** Idle thread.  Executes when no other thread is ready to run.
@@ -637,3 +688,44 @@ allocate_tid (void)
 /** Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof (struct thread, stack);
+
+/* priority = PRI_MAX - (recent_cpu / 4) - (nice * 2), clamped to [PRI_MIN, PRI_MAX]. */
+static int mlfqs_priority(const struct thread *t) {
+  int p = PRI_MAX
+          - fixed_to_int_trunc(fixed_div_int(t->recent_cpu, 4))
+          - t->nice * 2;
+  if (p < PRI_MIN) p = PRI_MIN;
+  if (p > PRI_MAX) p = PRI_MAX;
+  return p;
+}
+
+/* recent_cpu = (2*load_avg)/(2*load_avg + 1) * recent_cpu + nice. */
+static fixed_point_t
+mlfqs_recent_cpu (const struct thread *t)
+{
+  fixed_point_t two_load_avg = fixed_mul_int(load_avg, 2);
+  fixed_point_t two_load_avg_plus_one = fixed_add_int(two_load_avg, 1);
+  fixed_point_t coeff = fixed_div(two_load_avg, two_load_avg_plus_one);
+  return fixed_add_int(fixed_mul(coeff, t->recent_cpu), t->nice);
+}
+
+/* load_avg = (59/60)*load_avg + (1/60)*ready_threads. */
+static void
+mlfqs_update_load_avg (void)
+{
+  int ready = list_size (&ready_list);
+  if (thread_current () != idle_thread)
+    ready++;
+  load_avg = fixed_add (fixed_mul (fixed_div_int (int_to_fixed (59), 60), load_avg),
+                        fixed_mul_int (fixed_div_int (int_to_fixed (1), 60), ready));
+}
+
+/* thread_foreach() adapter: refresh one thread's recent_cpu, then its priority. */
+static void
+mlfqs_refresh_thread (struct thread *t, void *aux UNUSED)
+{
+  if (t == idle_thread)
+    return;
+  t->recent_cpu = mlfqs_recent_cpu (t);
+  t->priority   = mlfqs_priority (t);
+}

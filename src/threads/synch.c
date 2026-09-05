@@ -214,6 +214,14 @@ lock_acquire (struct lock *lock)
   ASSERT (!intr_context ());
   ASSERT (!lock_held_by_current_thread (lock));
   struct thread *curr = thread_current ();
+
+  /* The advanced scheduler does not use priority donation. */
+  if (thread_mlfqs) {
+    sema_down (&lock->semaphore);
+    lock->holder = curr;
+    return;
+  }
+
   if (lock->holder != NULL) { //donate priority
     curr->waiting_on_lock = lock;
     struct thread *t = lock->holder;
@@ -262,6 +270,15 @@ lock_release (struct lock *lock)
 {
   ASSERT (lock != NULL);
   ASSERT (lock_held_by_current_thread (lock));
+
+  /* The advanced scheduler does not use priority donation. */
+  if (thread_mlfqs) {
+    lock->holder = NULL;
+    sema_up (&lock->semaphore);
+    thread_yield_to_higher_priority();
+    return;
+  }
+
   list_remove(&lock->elem);
   lock->holder = NULL;
   struct thread *curr = thread_current();
