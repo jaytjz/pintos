@@ -1,1 +1,4 @@
 .idea/
+
+# compiled unit-test binary (rebuilt by `make -C src/tests/fixed-point check`)
+src/tests/fixed-point/test-fixed-point
