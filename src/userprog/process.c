@@ -20,6 +20,7 @@
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static bool push_arguments (int argc, char *argv[], void **esp);
 
 /** Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -38,12 +39,29 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  /* Derive the thread name from the program name (first word) only.
+     Use a separate buffer so fn_copy keeps the full command line. */
+  char name[16];
+  char *save_ptr;
+  strlcpy (name, file_name, sizeof name);
+  strtok_r (name, " ", &save_ptr);
+
+  if (name[0] == '\0')
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    palloc_free_page (fn_copy);
   return tid;
 }
+
+/** Maximum number of command-line arguments (including the program
+   name) that we will pass to a new process. */
+#define MAX_ARGS 32
 
 /** A thread function that loads a user process and starts it
    running. */
@@ -54,12 +72,32 @@ start_process (void *file_name_)
   struct intr_frame if_;
   bool success;
 
+  /* Split the command line into words.  Each argv[i] points into
+     file_name, so file_name must stay alive until push_arguments()
+     has copied the strings onto the user stack. */
+  char *argv[MAX_ARGS];
+  int argc = 0;
+  char *token, *save_ptr;
+  for (token = strtok_r (file_name, " ", &save_ptr);
+       token != NULL && argc < MAX_ARGS;
+       token = strtok_r (NULL, " ", &save_ptr))
+    argv[argc++] = token;
+
+  /* A command line of only spaces has no program to run. */
+  if (argc == 0)
+    {
+      palloc_free_page (file_name);
+      thread_exit ();
+    }
+
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (argv[0], &if_.eip, &if_.esp);
+  if (success)
+    success = push_arguments (argc, argv, &if_.esp);
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
@@ -86,7 +124,7 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid UNUSED)
 {
   return -1;
 }
@@ -442,6 +480,75 @@ setup_stack (void **esp)
         palloc_free_page (kpage);
     }
   return success;
+}
+
+/** Builds the initial user stack for a new process at *ESP (which
+   starts at PHYS_BASE), following the 80x86 calling convention that
+   _start() in lib/user/entry.c expects.  ARGV holds ARGC kernel
+   pointers to the argument strings.  Returns false, without
+   modifying *ESP, if the frame would not fit in the one-page user
+   stack. */
+static bool
+push_arguments (int argc, char *argv[], void **esp)
+{
+  uint8_t *sp = *esp;
+  uint8_t *stack_limit = (uint8_t *) PHYS_BASE - PGSIZE;
+  char *arg_addr[MAX_ARGS];
+  int i;
+
+  /* 1. Copy each argument string onto the stack, right to left. */
+  for (i = argc - 1; i >= 0; i--)
+    {
+      size_t len = strlen (argv[i]) + 1;
+      sp -= len;
+      if (sp < stack_limit)
+        return false;
+      memcpy (sp, argv[i], len);
+      arg_addr[i] = (char *) sp;
+    }
+
+  /* 2. Word-align down to a multiple of 4, zeroing the padding. */
+  while ((uintptr_t) sp % 4 != 0)
+    {
+      sp--;
+      if (sp < stack_limit)
+        return false;
+      *sp = 0;
+    }
+
+  /* Make sure the remaining argc + 4 words fit:
+     argv[argc] sentinel, argv[0..argc-1], argv, argc, return addr. */
+  if (sp - (argc + 4) * sizeof (void *) < stack_limit)
+    return false;
+
+  /* 3. Null sentinel: argv[argc]. */
+  sp -= sizeof (char *);
+  *(char **) sp = NULL;
+
+  /* 4. Pointers to the argument strings, argv[argc-1] .. argv[0]. */
+  for (i = argc - 1; i >= 0; i--)
+    {
+      sp -= sizeof (char *);
+      *(char **) sp = arg_addr[i];
+    }
+
+  /* 5. argv: address of argv[0], i.e. the current sp. */
+  {
+    char **argv_ptr = (char **) sp;
+    sp -= sizeof (char **);
+    *(char ***) sp = argv_ptr;
+  }
+
+  /* 6. argc. */
+  sp -= sizeof (int);
+  *(int *) sp = argc;
+
+  /* 7. Fake return address. */
+  sp -= sizeof (void *);
+  *(void **) sp = NULL;
+
+  *esp = sp;
+  return true;
 }
 
 /** Adds a mapping from user virtual address UPAGE to kernel
