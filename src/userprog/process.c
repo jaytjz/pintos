@@ -126,6 +126,10 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED)
 {
+  //TODO:Infinite Loop, not correct
+  while (true) {
+    
+  }
   return -1;
 }
 
@@ -135,6 +139,7 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+  printf ("%s: exit(%d)\n", cur->name, cur->exit_status);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
