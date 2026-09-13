@@ -26,6 +26,8 @@ typedef int tid_t;
 #define PRI_DEFAULT 31                  /**< Default priority. */
 #define PRI_MAX 63                      /**< Highest priority. */
 
+struct child_process;   /* forward decl — full type lives in process.h */
+
 /** A kernel thread or user process.
 
    Each thread structure is stored in its own 4 kB page.  The
@@ -82,6 +84,8 @@ typedef int tid_t;
    only because they are mutually exclusive: only a thread in the
    ready state is on the run queue, whereas only a thread in the
    blocked state is on a semaphore wait list. */
+struct child_process;                  /**< Full definition in userprog/process.h. */
+
 struct thread
   {
     /* Owned by thread.c. */
@@ -109,6 +113,8 @@ struct thread
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /**< Page directory. */
     int32_t exit_status;
+   struct list children;
+   struct child_process *cp;
 #endif
 
     /* Owned by thread.c. */

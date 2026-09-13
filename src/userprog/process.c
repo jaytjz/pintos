@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "../lib/kernel/list.h"
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/tss.h"
@@ -22,19 +24,65 @@ static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 static bool push_arguments (int argc, char *argv[], void **esp);
 
+struct start_process_args {
+  char *file_name;
+  struct child_process *cp;
+};
+
+/** Allocates and initializes a fresh child_process, ready to be handed off
+   to a not-yet-created child thread.  Returns NULL on allocation failure. */
+static struct child_process *
+child_process_create (void)
+{
+  struct child_process *cp = malloc (sizeof *cp);
+  if (cp == NULL)
+    return NULL;
+
+  cp->load_success = false;
+  cp->ref_count = 2;
+  sema_init (&cp->load_sema, 0);
+  sema_init (&cp->exit_sema, 0);
+  return cp;
+}
+
+/** Drops one reference to CP, freeing it once both the parent and the
+   child are done with it.  The decrement-and-check runs with interrupts
+   disabled so it can't race against the other side's release. */
+static void
+child_process_release (struct child_process *cp)
+{
+  enum intr_level old_level = intr_disable ();
+  cp->ref_count--;
+  bool should_free = (cp->ref_count == 0);
+  intr_set_level (old_level);
+
+  if (should_free)
+    free (cp);
+}
+
+/** Frees whatever of FN_COPY / ARGS / CP was already allocated (free() on
+   NULL is a no-op) and returns TID_ERROR, so every process_execute()
+   failure path can share one line instead of repeating the cleanup. */
+static tid_t
+process_execute_fail (char *fn_copy, struct start_process_args *args,
+                       struct child_process *cp)
+{
+  palloc_free_page (fn_copy);
+  free (args);
+  free (cp);
+  return TID_ERROR;
+}
+
 /** Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
 tid_t
-process_execute (const char *file_name) 
+process_execute (const char *file_name)
 {
-  char *fn_copy;
-  tid_t tid;
-
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
-  fn_copy = palloc_get_page (0);
+  char *fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
@@ -47,15 +95,33 @@ process_execute (const char *file_name)
   strtok_r (name, " ", &save_ptr);
 
   if (name[0] == '\0')
-    {
-      palloc_free_page (fn_copy);
-      return TID_ERROR;
-    }
+    return process_execute_fail (fn_copy, NULL, NULL);
+
+  struct start_process_args *process_args = malloc (sizeof *process_args);
+  struct child_process *cp =
+      process_args != NULL ? child_process_create () : NULL;
+  if (process_args == NULL || cp == NULL)
+    return process_execute_fail (fn_copy, process_args, cp);
+
+  process_args->file_name = fn_copy;
+  process_args->cp = cp;
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (name, PRI_DEFAULT, start_process, fn_copy);
+  tid_t tid = thread_create (name, PRI_DEFAULT, start_process, process_args);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy);
+    return process_execute_fail (fn_copy, process_args, cp);
+
+  cp->tid = tid;
+  list_push_back (&thread_current ()->children, &cp->elem);
+
+  /* Block until the child reports whether load() succeeded. */
+  sema_down (&cp->load_sema);
+  if (!cp->load_success)
+    {
+      list_remove (&cp->elem);
+      child_process_release (cp);
+      return TID_ERROR;
+    }
   return tid;
 }
 
@@ -66,9 +132,12 @@ process_execute (const char *file_name)
 /** A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *file_name_)
+start_process (void *args_)
 {
-  char *file_name = file_name_;
+  struct start_process_args *args = args_;
+  char *file_name = args->file_name;
+  struct child_process *cp = args->cp;
+  free (args);
   struct intr_frame if_;
   bool success;
 
@@ -83,10 +152,14 @@ start_process (void *file_name_)
        token = strtok_r (NULL, " ", &save_ptr))
     argv[argc++] = token;
 
+  thread_current()->cp = cp;
+
   /* A command line of only spaces has no program to run. */
   if (argc == 0)
     {
       palloc_free_page (file_name);
+      cp->load_success = false;
+      sema_up(&cp->load_sema);
       thread_exit ();
     }
 
@@ -101,8 +174,12 @@ start_process (void *file_name_)
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
+  if (!success)
+    {
+      cp->load_success = false;
+      sema_up (&cp->load_sema);
+      thread_exit ();
+    }
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -110,6 +187,8 @@ start_process (void *file_name_)
      arguments on the stack in the form of a `struct intr_frame',
      we just point the stack pointer (%esp) to our stack frame
      and jump to it. */
+  cp->load_success = true;
+  sema_up (&cp->load_sema);
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
   NOT_REACHED ();
 }
@@ -119,18 +198,30 @@ start_process (void *file_name_)
    exception), returns -1.  If TID is invalid or if it was not a
    child of the calling process, or if process_wait() has already
    been successfully called for the given TID, returns -1
-   immediately, without waiting.
-
-   This function will be implemented in problem 2-2.  For now, it
-   does nothing. */
+   immediately, without waiting. */
 int
-process_wait (tid_t child_tid UNUSED)
+process_wait (tid_t child_tid)
 {
-  //TODO:Infinite Loop, not correct
-  while (true) {
-    
+  struct child_process *cp = NULL;
+  struct list_elem* e;
+  for (e = list_begin(&thread_current()->children);
+       e != list_end(&thread_current()->children);
+       e = list_next(e)) {
+    struct child_process *candidate = list_entry(e, struct child_process, elem);
+    if (candidate->tid == child_tid) {
+      cp = candidate;
+      break;
+    }
   }
-  return -1;
+
+  if (cp == NULL)
+    return -1;
+
+  sema_down(&cp->exit_sema);
+  int status = cp->exit_status;
+  list_remove(&cp->elem);
+  child_process_release(cp);
+  return status;
 }
 
 /** Free the current process's resources. */
@@ -139,6 +230,20 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+
+  if (cur->cp != NULL)
+    {
+      cur->cp->exit_status = cur->exit_status;
+      sema_up (&cur->cp->exit_sema);
+      child_process_release (cur->cp);
+    }
+
+  while (!list_empty (&cur->children))
+    {
+      struct list_elem *e = list_pop_front (&cur->children);
+      struct child_process *cp = list_entry (e, struct child_process, elem);
+      child_process_release (cp);
+    }
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */

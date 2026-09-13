@@ -570,6 +570,7 @@ init_thread (struct thread *t, const char *name, int priority)
   t->magic = THREAD_MAGIC;
 #ifdef USERPROG
   t->exit_status = -1;
+  list_init (&t->children);
 #endif
   sema_init (&t->sleep_sema, 0);
 

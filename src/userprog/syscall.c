@@ -6,6 +6,7 @@
 #include "devices/shutdown.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
+#include "userprog/process.h"
 #include "../lib/kernel/stdio.h"
 
 static void syscall_handler (struct intr_frame *);
@@ -85,6 +86,17 @@ void validate_n_args (struct intr_frame *f, int n) {
   }
 }
 
+static bool
+is_valid_user_string (const char *str)
+{
+  for (;;str++) {
+    if (!is_valid_user_vaddr((str)))
+      return false;
+    if (*str == '\0')
+      return true;
+  }
+}
+
 static void
 syscall_handler (struct intr_frame *f)
 {
@@ -101,6 +113,22 @@ syscall_handler (struct intr_frame *f)
       uint32_t status = *((uint32_t *) f->esp + 1);
       thread_current ()->exit_status = status;
       thread_exit ();
+      break;
+    }
+    case SYS_EXEC:
+    {
+      validate_n_args (f, 1);
+      const char* cmd_line = (const char *) *((uint32_t *) f->esp + 1);
+      if (!is_valid_user_string(cmd_line))
+        kill_process();
+      f->eax = process_execute(cmd_line);
+      break;
+    }
+    case SYS_WAIT:
+    {
+      validate_n_args (f, 1);
+      tid_t pid = (tid_t) *((uint32_t *) f->esp + 1);
+      f->eax = process_wait(pid);
       break;
     }
     case SYS_WRITE:
