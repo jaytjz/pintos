@@ -573,6 +573,7 @@ init_thread (struct thread *t, const char *name, int priority)
   list_init (&t->children);
   list_init (&t->fd_list);
   t->next_fd = 2; //STDIN_FILENO = 0, STDOUT_FILENO = 1
+  t->exec_file = NULL;
 #endif
   sema_init (&t->sleep_sema, 0);
 

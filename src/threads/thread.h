@@ -117,6 +117,7 @@ struct thread
    struct child_process *cp;
    struct list fd_list;
    int next_fd;
+   struct file *exec_file;
 #endif
 
     /* Owned by thread.c. */

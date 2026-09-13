@@ -251,6 +251,13 @@ process_exit (void)
     lock_acquire(&filesys_lock);
     file_close(entry->file);
     lock_release(&filesys_lock);
+    free(entry);
+  }
+
+  if (cur->exec_file != NULL) {
+    lock_acquire(&filesys_lock);
+    file_close(cur->exec_file);
+    lock_release(&filesys_lock);
   }
 
   /* Destroy the current process's page directory and switch back
@@ -466,6 +473,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
   *eip = (void (*) (void)) ehdr.e_entry;
 
   success = true;
+  file_deny_write(file);
+  thread_current()->exec_file = file;
+  return success;
 
  done:
   /* We arrive here whether the load is successful or not. */
