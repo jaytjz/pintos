@@ -1,6 +1,8 @@
 #include "userprog/syscall.h"
 #include <stdio.h>
 #include <syscall-nr.h>
+
+#include "../lib/kernel/list.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "devices/shutdown.h"
@@ -8,6 +10,7 @@
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
 #include "../lib/kernel/stdio.h"
+#include "filesys/filesys.h"
 
 static void syscall_handler (struct intr_frame *);
 
@@ -97,6 +100,16 @@ is_valid_user_string (const char *str)
   }
 }
 
+static struct fd_entry * get_fd_entry (int fd) {
+  struct list *fd_list = &thread_current()->fd_list;
+  for (struct list_elem *e = list_begin(fd_list); e != list_end(fd_list); e = list_next(e)) {
+    struct fd_entry *entry = list_entry(e, struct fd_entry, elem);
+    if (entry->fd == fd)
+      return entry;
+  }
+  return NULL;
+}
+
 static void
 syscall_handler (struct intr_frame *f)
 {
@@ -131,24 +144,155 @@ syscall_handler (struct intr_frame *f)
       f->eax = process_wait(pid);
       break;
     }
+    case SYS_CREATE:
+    {
+      validate_n_args (f, 2);
+      const char *file = (const char *) *((uint32_t *) f->esp + 1);
+      unsigned initial_size = (unsigned) *((uint32_t *) f->esp + 2);
+      if (!is_valid_user_string(file))
+        kill_process();
+      lock_acquire(&filesys_lock);
+      f->eax = filesys_create(file, initial_size);
+      lock_release(&filesys_lock);
+      break;
+    }
+    case SYS_REMOVE:
+    {
+      validate_n_args (f, 1);
+      const char *file = (const char *) *((uint32_t *) f->esp + 1);
+      if (!is_valid_user_string(file))
+        kill_process();
+      lock_acquire(&filesys_lock);
+      f->eax = filesys_remove(file);
+      lock_release(&filesys_lock);
+      break;
+    }
+    case SYS_OPEN:
+    {
+      validate_n_args (f, 1);
+      const char *file = (const char *) *((uint32_t *) f->esp + 1);
+      if (!is_valid_user_string(file))
+        kill_process();
+      struct fd_entry *entry = malloc (sizeof (struct fd_entry));
+      if (entry == NULL) {
+        f->eax = -1;
+        break;
+      }
+      lock_acquire(&filesys_lock);
+      struct file *opened_file = filesys_open(file);
+      lock_release(&filesys_lock);
+      if (opened_file == NULL) {
+        free(entry);
+        f->eax = -1;
+        break;
+      }
+      entry->fd = thread_current()->next_fd++;
+      entry->file = opened_file;
+      list_push_back(&thread_current()->fd_list, &entry->elem);
+      f->eax = entry->fd;
+      break;
+    }
+    case SYS_FILESIZE:
+    {
+      validate_n_args (f, 1);
+      int fd = *((uint32_t *) f->esp + 1);
+      struct fd_entry *entry = get_fd_entry(fd);
+      if (entry == NULL)
+        kill_process();
+      struct file *file = entry->file;
+      lock_acquire(&filesys_lock);
+      f->eax = file_length(entry->file);
+      lock_release(&filesys_lock);
+      break;
+    }
+    case SYS_READ:
+    {
+      validate_n_args (f, 3);
+      int32_t fd = *((int32_t *) f->esp + 1);
+      void *buffer = (void *) *((uint32_t *) f->esp + 2);
+      uint32_t size = *((uint32_t *) f->esp + 3);
+      if (!is_valid_user_vaddr_bounds (buffer, size))
+        kill_process();
+
+      if (fd == STDIN_FILENO) {
+        for (uint32_t i = 0; i < size; i++)
+          ((uint8_t *) buffer)[i] = input_getc();
+      }
+      else if (fd == STDOUT_FILENO) {
+        kill_process();   // reading from stdout is invalid
+      }
+      else {
+        struct fd_entry *entry = get_fd_entry(fd);
+        if (entry == NULL)
+          kill_process();
+        lock_acquire(&filesys_lock);
+        f->eax = file_read(entry->file, buffer, size);
+        lock_release(&filesys_lock);
+      }
+      break;
+    }
     case SYS_WRITE:
     {
       validate_n_args (f, 3);
       int32_t fd = *((int32_t *) f->esp + 1);
       const void *buffer = (const void *) *((uint32_t *) f->esp + 2);
       uint32_t size = *((uint32_t *) f->esp + 3);
+      if (!is_valid_user_vaddr_bounds (buffer, size))
+        kill_process ();
       if (fd == STDOUT_FILENO)
       {
-        if (!is_valid_user_vaddr_bounds (buffer, size))
-          kill_process ();
         putbuf(buffer, size);
         f->eax = size;
       }
-      else
+      else if (fd == STDIN_FILENO)
       {
-        //TODO: Implement after fd table
-        f->eax = -1;
+        kill_process();   // writing to stdin is invalid
       }
+      else {
+        struct fd_entry *entry = get_fd_entry(fd);
+        if (entry == NULL)
+          kill_process();
+        lock_acquire(&filesys_lock);
+        f->eax = file_write(entry->file, buffer, size);
+        lock_release(&filesys_lock);
+      }
+      break;
+    }
+    case SYS_SEEK: {
+      validate_n_args (f, 2);
+      int fd = *((uint32_t *) f->esp + 1);
+      unsigned position = *((uint32_t *) f->esp + 2);
+      struct fd_entry *entry = get_fd_entry(fd);
+      if (entry == NULL)
+        kill_process();
+      lock_acquire(&filesys_lock);
+      file_seek(entry->file, position);
+      lock_release(&filesys_lock);
+      break;
+    }
+    case SYS_TELL: {
+      validate_n_args (f, 1);
+      int fd = *((uint32_t *) f->esp + 1);
+      struct fd_entry *entry = get_fd_entry(fd);
+      if (entry == NULL)
+        kill_process();
+      lock_acquire(&filesys_lock);
+      f->eax = file_tell(entry->file);
+      lock_release(&filesys_lock);
+      break;
+    }
+    case SYS_CLOSE:
+    {
+      validate_n_args (f, 1);
+      int fd = *((uint32_t *) f->esp + 1);
+      struct fd_entry *entry = get_fd_entry(fd);
+      if (entry == NULL)
+        kill_process();
+      list_remove(&entry->elem);
+      lock_acquire(&filesys_lock);
+      file_close(entry->file);
+      lock_release(&filesys_lock);
+      free(entry);
       break;
     }
     default:

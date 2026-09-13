@@ -19,4 +19,10 @@ struct child_process {
 
 };
 
+struct fd_entry {
+	int fd;
+	struct file *file;
+	struct list_elem elem;
+};
+
 #endif /**< userprog/process.h */

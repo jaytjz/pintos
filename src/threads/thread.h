@@ -115,6 +115,8 @@ struct thread
     int32_t exit_status;
    struct list children;
    struct child_process *cp;
+   struct list fd_list;
+   int next_fd;
 #endif
 
     /* Owned by thread.c. */

@@ -245,6 +245,14 @@ process_exit (void)
       child_process_release (cp);
     }
 
+  while (!list_empty(&cur->fd_list)) {
+    struct list_elem *e = list_pop_front (&cur->fd_list);
+    struct fd_entry *entry = list_entry (e, struct fd_entry, elem);
+    lock_acquire(&filesys_lock);
+    file_close(entry->file);
+    lock_release(&filesys_lock);
+  }
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
